@@ -2,6 +2,7 @@ package com.wheregoes.enginesound;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.os.Handler;
@@ -17,6 +18,7 @@ import android.widget.LinearLayout;
 import android.widget.Switch;
 import android.widget.TextView;
 
+import com.wheregoes.byd.AutoStart;
 import com.wheregoes.byd.Vehicle;
 
 import java.lang.reflect.Method;
@@ -34,7 +36,7 @@ public class MainActivity extends Activity {
 
     private static final String TAG = "EngineSound";
 
-    private static final String PREFS = "engine_sound_prefs";
+    private static final String PREFS = EngineConfig.PREFS;
     private static final String KEY_NAME_PREFIX = "preset_name_";
 
     private static final int D = 1002;
@@ -74,6 +76,8 @@ public class MainActivity extends Activity {
     private static final long CYCLE_DWELL_MS = 2500;
     /** Pause between a write and its readback; the MCU does not answer instantly. */
     private static final long SETTLE_MS = 120;
+    /** Pause after the enable sequence, before the first source-type write lands. */
+    private static final long WARMUP_SETTLE_MS = 500;
 
     private Object mgr;
     private Method setIntMethod;
@@ -119,6 +123,11 @@ public class MainActivity extends Activity {
         setContentView(R.layout.activity_main);
 
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        // Start from the saved preset (3 by default), not from 1.
+        pendingType = clamp(prefs.getInt(EngineConfig.KEY_PRESET, EngineConfig.DEFAULT_PRESET));
+        if (prefs.getBoolean(EngineConfig.KEY_AUTO, false)) {
+            startForegroundService(new Intent(this, AutoKeepService.class));
+        }
 
         typeLabel = findViewById(R.id.type_label);
         presetName = findViewById(R.id.preset_name);
@@ -153,6 +162,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        AutoKeepService.sUiActive = true;
         // First launch: initVehicle() does its own refresh once it is connected.
         if (ready) {
             io.post(this::readVehicleState);
@@ -162,6 +172,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
+        AutoKeepService.sUiActive = false;
         stopCycle();
     }
 
@@ -230,7 +241,7 @@ public class MainActivity extends Activity {
         Integer state = getInt(FID_STATE_GET);
         Integer src = getInt(FID_SRC_TYPE_GET);
         runOnUiThread(() -> {
-            if (src != null && src > 0) {
+            if (src != null && src > 0 && state != null && state == 1) {
                 pendingType = clamp(src);
             }
             renderPreset(pendingType);
@@ -296,6 +307,9 @@ public class MainActivity extends Activity {
             return;
         }
         final int got = back;
+        if (got == want) {
+            prefs.edit().putInt(EngineConfig.KEY_PRESET, got).apply();
+        }
         // A car that stores the preset and then drops STATE back to 0 is what
         // "plays louder for a moment, then goes back to normal" looks like. The
         // status used to be rendered from the cached simOn flag, so the UI kept
@@ -334,8 +348,11 @@ public class MainActivity extends Activity {
                     return;
                 }
             }
-            setInt(FID_SRC_TYPE_SET, pendingType);
-            settle();
+            // The audio engine is not awake the instant STATE_SET lands: a source-type
+            // write right here is stored by the MCU but does not reach the speaker (see
+            // primeAndApply). Warming up on a throwaway value first, then writing the
+            // real target, is what actually produces sound on the first try.
+            primeAndApply(pendingType);
             Integer state = getInt(FID_STATE_GET);
             lastWriteLine = "write 0x3E300020 = 1 -> STATE "
                     + (state == null ? "read failed" : state);
@@ -344,6 +361,7 @@ public class MainActivity extends Activity {
                 syncToggle(on);
                 if (on) {
                     setStatus(getString(R.string.sim_on, pendingType), R.color.success);
+                    armAutoKeep();
                 } else {
                     setStatus(getString(R.string.sim_verify_failed), R.color.danger);
                 }
@@ -352,8 +370,34 @@ public class MainActivity extends Activity {
         });
     }
 
+    /**
+     * Runs on the io thread. Writes {@code target} so it is actually audible, not
+     * just stored.
+     *
+     * Right after the enable sequence, the first SOURCE_TYPE_SET write is accepted
+     * and echoed back by the MCU but does not come out of the speaker -- confirmed
+     * on a Dolphin: picking preset 4 straight after turning the sound on saved 4 but
+     * stayed silent, and only played once the app had been pointed at another preset
+     * first. A longer settle alone was not enough; it took an actual value change.
+     * So this always does a throwaway write to prime the audio path, then the write
+     * that matters.
+     */
+    private void primeAndApply(int target) {
+        int primer = (target == 1) ? 2 : 1;
+        setInt(FID_SRC_TYPE_SET, primer);
+        try {
+            Thread.sleep(WARMUP_SETTLE_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        setInt(FID_SRC_TYPE_SET, target);
+        settle();
+    }
+
     private void disableSim() {
         stopCycle();
+        prefs.edit().putBoolean(EngineConfig.KEY_AUTO, false).apply();
+        stopService(new Intent(this, AutoKeepService.class));
         io.post(() -> {
             setInt(FID_STATE_SET, 0);
             // The MCU does not answer instantly; without this the read was stale
@@ -371,6 +415,29 @@ public class MainActivity extends Activity {
             });
             refreshVehiclePanel();
         });
+    }
+
+    // ---------------------------------------------------------------- auto keep
+
+    /** Main thread: remember the choice and start the keeper that restores it after a restart. */
+    private void armAutoKeep() {
+        prefs.edit()
+                .putBoolean(EngineConfig.KEY_AUTO, true)
+                .putInt(EngineConfig.KEY_PRESET, pendingType)
+                .apply();
+        startForegroundService(new Intent(this, AutoKeepService.class));
+        if (AutoStart.shouldRemind(this, prefs)) {
+            new AlertDialog.Builder(this)
+                    .setTitle(R.string.autostart_title)
+                    .setMessage(R.string.autostart_msg)
+                    .setPositiveButton(R.string.autostart_open, (d, w) -> {
+                        if (AutoStart.open(this)) {
+                            AutoStart.markReminded(this, prefs);
+                        }
+                    })
+                    .setNegativeButton(R.string.cancel, null)
+                    .show();
+        }
     }
 
     // ------------------------------------------------------------------ cycling
