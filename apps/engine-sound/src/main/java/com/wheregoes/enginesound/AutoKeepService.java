@@ -54,7 +54,7 @@ public class AutoKeepService extends Service {
     /** Mirrors MainActivity.primeAndApply: the engine stays silent on the very
      *  first source-type write right after enabling, so a throwaway value goes
      *  first, with a longer pause, before the real target is written. */
-    private static final long WARMUP_SETTLE_MS = 500;
+    private static final long WARMUP_SETTLE_MS = 1500;
     private static final int MAX_FAST_FIXES = 5;
 
     private HandlerThread ioThread;

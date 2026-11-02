@@ -77,7 +77,7 @@ public class MainActivity extends Activity {
     /** Pause between a write and its readback; the MCU does not answer instantly. */
     private static final long SETTLE_MS = 120;
     /** Pause after the enable sequence, before the first source-type write lands. */
-    private static final long WARMUP_SETTLE_MS = 500;
+    private static final long WARMUP_SETTLE_MS = 1500;
 
     private Object mgr;
     private Method setIntMethod;
@@ -101,6 +101,13 @@ public class MainActivity extends Activity {
 
     /** Written on the main thread, read on the io thread. */
     private volatile int pendingType = 1;
+    /**
+     * False right after the simulator is switched on. The audio path is not awake
+     * yet at that instant, so the first source-type write this power-on -- whichever
+     * code path it comes from (the enable sequence, a preset chip, NEXT/PREV, or
+     * Cycle) -- is primed instead of written plain. Cleared again on disableSim().
+     */
+    private volatile boolean audioWarmedUp = false;
     private volatile boolean cycling = false;
     private volatile boolean ready = false;
     private boolean simOn = false;
@@ -290,12 +297,16 @@ public class MainActivity extends Activity {
 
     private void applyPendingNow() {
         final int want = pendingType;
-        if (!setInt(FID_SRC_TYPE_SET, want)) {
+        final boolean write = audioWarmedUp
+                ? setInt(FID_SRC_TYPE_SET, want)
+                : primeAndApply(want);
+        if (!write) {
             runOnUiThread(() ->
                     setStatus(getString(R.string.write_failed, want), R.color.danger));
             refreshVehiclePanel();
             return;
         }
+        audioWarmedUp = true;
         settle();
         Integer back = getInt(FID_SRC_TYPE_GET);
         lastWriteLine = "write 0x3E300038 = " + want + " -> read "
@@ -353,6 +364,7 @@ public class MainActivity extends Activity {
             // primeAndApply). Warming up on a throwaway value first, then writing the
             // real target, is what actually produces sound on the first try.
             primeAndApply(pendingType);
+            audioWarmedUp = true;
             Integer state = getInt(FID_STATE_GET);
             lastWriteLine = "write 0x3E300020 = 1 -> STATE "
                     + (state == null ? "read failed" : state);
@@ -381,8 +393,11 @@ public class MainActivity extends Activity {
      * first. A longer settle alone was not enough; it took an actual value change.
      * So this always does a throwaway write to prime the audio path, then the write
      * that matters.
+     *
+     * @return whether the final (target) write round-tripped to the vehicle; a
+     *         false here means the CAN write itself failed, not that it was silent.
      */
-    private void primeAndApply(int target) {
+    private boolean primeAndApply(int target) {
         int primer = (target == 1) ? 2 : 1;
         setInt(FID_SRC_TYPE_SET, primer);
         try {
@@ -390,12 +405,14 @@ public class MainActivity extends Activity {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-        setInt(FID_SRC_TYPE_SET, target);
+        boolean ok = setInt(FID_SRC_TYPE_SET, target);
         settle();
+        return ok;
     }
 
     private void disableSim() {
         stopCycle();
+        audioWarmedUp = false;
         prefs.edit().putBoolean(EngineConfig.KEY_AUTO, false).apply();
         stopService(new Intent(this, AutoKeepService.class));
         io.post(() -> {
@@ -487,7 +504,8 @@ public class MainActivity extends Activity {
             });
             return;
         }
-        boolean ok = setInt(FID_SRC_TYPE_SET, t);
+        boolean ok = audioWarmedUp ? setInt(FID_SRC_TYPE_SET, t) : primeAndApply(t);
+        audioWarmedUp = true;
         settle();
         final Integer back = getInt(FID_SRC_TYPE_GET);
         if (!ok || back == null || back != t) {
