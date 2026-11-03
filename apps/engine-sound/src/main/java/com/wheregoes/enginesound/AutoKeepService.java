@@ -54,7 +54,10 @@ public class AutoKeepService extends Service {
     /** Mirrors MainActivity.primeAndApply: the engine stays silent on the very
      *  first source-type write right after enabling, so a throwaway value goes
      *  first, with a longer pause, before the real target is written. */
-    private static final long WARMUP_SETTLE_MS = 1500;
+    private static final long WARMUP_SETTLE_MS = 2000;
+    /** Confirmed by ear to actually produce sound -- see MainActivity.WAKE_PRESET. */
+    private static final int WAKE_PRESET = 2;
+    private static final int FALLBACK_WAKE_PRESET = 1;
     private static final int MAX_FAST_FIXES = 5;
 
     private HandlerThread ioThread;
@@ -160,10 +163,12 @@ public class AutoKeepService extends Service {
             }
         }
         if (wasOff) {
-            // Freshly enabled (e.g. right after boot): the first source-type write
-            // is stored but silent, so warm up on a throwaway value first.
-            int primer = (target == 1) ? 2 : 1;
-            setInt(FID_SRC_TYPE_SET, primer);
+            // Freshly enabled (e.g. right after boot): start on a preset confirmed
+            // to actually make sound (WAKE_PRESET), then move to the real target.
+            // Preset 1 reads back fine but is silent on this car, so it cannot wake
+            // anything by itself -- it has to be a preset that genuinely plays.
+            int wake = (target == WAKE_PRESET) ? FALLBACK_WAKE_PRESET : WAKE_PRESET;
+            setInt(FID_SRC_TYPE_SET, wake);
             sleep(WARMUP_SETTLE_MS);
         }
         setInt(FID_SRC_TYPE_SET, target);

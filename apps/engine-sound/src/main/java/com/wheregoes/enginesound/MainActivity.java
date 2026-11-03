@@ -77,7 +77,12 @@ public class MainActivity extends Activity {
     /** Pause between a write and its readback; the MCU does not answer instantly. */
     private static final long SETTLE_MS = 120;
     /** Pause after the enable sequence, before the first source-type write lands. */
-    private static final long WARMUP_SETTLE_MS = 1500;
+    private static final long WARMUP_SETTLE_MS = 2000;
+    /** Confirmed by ear to actually produce sound on this car -- used to wake the
+     *  audio path before switching to whatever the user really wants. */
+    private static final int WAKE_PRESET = 2;
+    /** Used only on the rare case the user's own target preset IS the wake preset. */
+    private static final int FALLBACK_WAKE_PRESET = 1;
 
     private Object mgr;
     private Method setIntMethod;
@@ -391,23 +396,34 @@ public class MainActivity extends Activity {
      * on a Dolphin: picking preset 4 straight after turning the sound on saved 4 but
      * stayed silent, and only played once the app had been pointed at another preset
      * first. A longer settle alone was not enough; it took an actual value change.
-     * So this always does a throwaway write to prime the audio path, then the write
-     * that matters.
+     * So this always starts on a preset confirmed to actually make sound, then
+     * switches to the real target after a real pause -- same as doing it by hand.
+     *
+     * Confirmed on this car: preset 1 writes and reads back fine but produces no
+     * sound by itself, so writing it does not wake anything -- it has to be a
+     * preset that genuinely plays, which here is {@link #WAKE_PRESET}. Starting
+     * there and then moving to the target is what worked by hand; no extra
+     * throwaway write of the target beforehand is needed.
      *
      * @return whether the final (target) write round-tripped to the vehicle; a
      *         false here means the CAN write itself failed, not that it was silent.
      */
     private boolean primeAndApply(int target) {
-        int primer = (target == 1) ? 2 : 1;
-        setInt(FID_SRC_TYPE_SET, primer);
-        try {
-            Thread.sleep(WARMUP_SETTLE_MS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        int wake = (target == WAKE_PRESET) ? FALLBACK_WAKE_PRESET : WAKE_PRESET;
+        setInt(FID_SRC_TYPE_SET, wake);
+        runOnUiThread(() -> setStatus(getString(R.string.sim_waking, wake), R.color.fg_secondary));
+        sleepMs(WARMUP_SETTLE_MS);
         boolean ok = setInt(FID_SRC_TYPE_SET, target);
         settle();
         return ok;
+    }
+
+    private static void sleepMs(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private void disableSim() {
